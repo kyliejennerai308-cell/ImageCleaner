@@ -173,7 +173,12 @@ PALETTE = {
 }
 
 # Convert palette to arrays for vectorized operations
-PALETTE_ARRAY = np.array(list(PALETTE.values()), dtype=np.float32)
+PALETTE_ARRAY_UINT8 = np.array(list(PALETTE.values()), dtype=np.uint8)
+PALETTE_ARRAY = PALETTE_ARRAY_UINT8.astype(np.float32)
+PALETTE_LAB_ARRAY = cv2.cvtColor(
+    PALETTE_ARRAY_UINT8.reshape(-1, 1, 3),
+    cv2.COLOR_BGR2LAB
+).reshape(-1, 3).astype(np.float32)
 PALETTE_NAMES = list(PALETTE.keys())
 
 
@@ -244,6 +249,48 @@ def _remove_small_components(mask, min_area=20):
         if area >= min_area:
             cleaned[labels == label] = 1
     return cleaned.astype(bool)
+
+
+def pre_smooth_texture(img, passes=2, d=9, sigma_color=50, sigma_space=50):
+    """
+    Apply multiple bilateral passes to flatten texture and banding
+    before color segmentation.
+    """
+    print("Pre-smoothing scan texture with bilateral filtering...")
+    smoothed = img.copy()
+    for _ in range(passes):
+        smoothed = cv2.bilateralFilter(smoothed, d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
+    return smoothed
+
+
+def apply_clahe_lab(img, clip_limit=2.0, tile_grid_size=(8, 8)):
+    """
+    Normalize illumination using CLAHE on the L channel in LAB space.
+    """
+    print("Applying CLAHE lighting normalization...")
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    l_channel = clahe.apply(l_channel)
+    lab_normalized = cv2.merge([l_channel, a_channel, b_channel])
+    return cv2.cvtColor(lab_normalized, cv2.COLOR_LAB2BGR)
+
+
+def remove_specular_highlights(img, s_thresh=40, v_thresh=220, inpaint_radius=3):
+    """
+    Detect and inpaint bright, low-saturation glare regions.
+    """
+    print("Removing specular highlights via inpainting...")
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    _, s, v = cv2.split(hsv)
+    glare_mask = (s < s_thresh) & (v > v_thresh)
+    if not np.any(glare_mask):
+        print("  No specular highlights detected")
+        return img
+    mask = (glare_mask.astype(np.uint8) * 255)
+    glare_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.dilate(mask, glare_kernel, iterations=1)
+    return cv2.inpaint(img, mask, inpaintRadius=inpaint_radius, flags=cv2.INPAINT_TELEA)
 
 
 def preprocess_with_hsv(img, use_natural_green=False, skip_infill=False):
@@ -408,6 +455,21 @@ def preprocess_with_hsv(img, use_natural_green=False, skip_infill=False):
     hot_pink_mask = pink_hue_mask & (v > 240)
     outline_magenta_mask = pink_hue_mask & (v > 180) & (v <= 240)
     dark_purple_mask = pink_hue_mask & (v > 50) & (v <= 180)
+    
+    # Close small gaps in outline layers without thickening fills
+    outline_close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    outline_magenta_mask = cv2.morphologyEx(
+        outline_magenta_mask.astype(np.uint8) * 255,
+        cv2.MORPH_CLOSE,
+        outline_close_kernel,
+        iterations=1
+    ) > 0
+    dark_purple_mask = cv2.morphologyEx(
+        dark_purple_mask.astype(np.uint8) * 255,
+        cv2.MORPH_CLOSE,
+        outline_close_kernel,
+        iterations=1
+    ) > 0
     
     # Use contour-tree approach for hot pink to respect internal holes (e.g., logo text)
     pink_uint8 = hot_pink_mask.astype(np.uint8) * 255
@@ -729,7 +791,7 @@ def morphological_cleanup(
 
 def snap_to_palette(img, protect_outlines=False):
     """
-    Snap every pixel to the nearest palette color using Euclidean distance.
+    Snap every pixel to the nearest palette color using Lab distance.
     Uses tile-based processing for large images to prevent memory exhaustion.
     """
     print("Snapping to palette colors...")
@@ -815,12 +877,15 @@ def _snap_to_palette_single(img, show_stats=True):
     Helper function to snap a single image/tile to palette colors.
     This is the core snapping logic extracted for reuse.
     """
+    # Convert to Lab for perceptual color distance
+    img_lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    
     # Reshape image to (num_pixels, 3)
-    pixels = img.reshape(-1, 3).astype(np.float32)
+    pixels = img_lab.reshape(-1, 3)
     
     # Compute distance to each palette color (vectorized)
     # Shape: (num_pixels, num_colors)
-    distances = np.linalg.norm(pixels[:, np.newaxis, :] - PALETTE_ARRAY[np.newaxis, :, :], axis=2)
+    distances = np.linalg.norm(pixels[:, np.newaxis, :] - PALETTE_LAB_ARRAY[np.newaxis, :, :], axis=2)
     
     # Find closest palette color for each pixel
     closest_indices = np.argmin(distances, axis=1)
@@ -1050,6 +1115,11 @@ def vectorize_edges(img, straightness_threshold=0.001, min_contour_area=500):
             
         color_bgr = np.array(color_bgr, dtype=np.uint8)
         mask = np.all(img == color_bgr, axis=2).astype(np.uint8) * 255
+        is_outline_color = color_name in outline_color_names
+        
+        if is_outline_color:
+            close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
         
         if np.sum(mask) < min_contour_area:
             continue
@@ -1059,7 +1129,6 @@ def vectorize_edges(img, straightness_threshold=0.001, min_contour_area=500):
             continue
         
         new_mask = np.zeros_like(mask)
-        is_outline_color = color_name in outline_color_names
         
         for i, contour in enumerate(contours):
             if cv2.contourArea(contour) < 50: 
@@ -1067,27 +1136,17 @@ def vectorize_edges(img, straightness_threshold=0.001, min_contour_area=500):
             
             total_contours_processed += 1
             perimeter = cv2.arcLength(contour, True)
-            
-            # Check for rectangularity (Ladder rungs, text blocks)
-            epsilon_rough = 0.02 * perimeter
-            approx_rough = cv2.approxPolyDP(contour, epsilon_rough, True)
+            epsilon = straightness_threshold * perimeter
+            approx = cv2.approxPolyDP(contour, epsilon, True)
             
             # Determine drawing mode: stroke for outline colors, fill for others
             if is_outline_color:
                 # Draw as STROKE, not fill - preserves outline nature
                 thickness = min(2, max(1, int(0.003 * perimeter)))  # Thin for outlines
-                epsilon = straightness_threshold * perimeter
-                approx = cv2.approxPolyDP(contour, epsilon, True)
-                cv2.drawContours(new_mask, [approx], -1, 255, thickness=thickness)
-            elif len(approx_rough) == 4 and cv2.isContourConvex(approx_rough):
-                # If it's a simple rectangle, enforce straight lines (filled)
-                approx = _snap_to_right_angles(approx_rough)
-                cv2.drawContours(new_mask, [approx], -1, 255, -1)
+                cv2.drawContours(new_mask, [approx], -1, 255, thickness=thickness, lineType=cv2.LINE_8)
             else:
-                # Complex shapes - preserve curves with low epsilon
-                epsilon = straightness_threshold * perimeter
-                approx = cv2.approxPolyDP(contour, epsilon, True)
-                cv2.drawContours(new_mask, [approx], -1, 255, -1)
+                # Preserve curves with low epsilon
+                cv2.drawContours(new_mask, [approx], -1, 255, -1, lineType=cv2.LINE_8)
         
         # Handle holes (hierarchy level 1) - only for filled regions
         if hierarchy is not None and not is_outline_color:
@@ -1327,20 +1386,25 @@ def restore_image(image_path, output_dir, use_gpu=False, gpu_backend=None, skip_
     # Phase 1: Load and upscale (GPU accelerated if enabled)
     img_large, original_size = load_and_upscale(image_path, use_gpu=use_gpu, gpu_backend=gpu_backend)
     
-    # Phase 2: Detect text regions for protection BEFORE any processing
-    text_mask = detect_text_regions(img_large)
+    # Phase 2: Preprocess illumination/texture before segmentation
+    img_smoothed = pre_smooth_texture(img_large)
+    img_normalized = apply_clahe_lab(img_smoothed)
+    img_corrected = remove_specular_highlights(img_normalized)
     
-    # Phase 3: HSV-based color preprocessing
+    # Phase 3: Detect text regions for protection BEFORE any segmentation
+    text_mask = detect_text_regions(img_corrected)
+    
+    # Phase 4: HSV-based color preprocessing
     img_preprocessed, green_outline_mask, white_mask_large = preprocess_with_hsv(
-        img_large,
+        img_corrected,
         use_natural_green=use_natural_green,
         skip_infill=skip_infill
     )
     
-    # Phase 3b: Flatten background wrinkles before palette snapping
+    # Phase 4b: Flatten background wrinkles before palette snapping
     img_flattened = flatten_background_wrinkles(img_preprocessed)
     
-    # Phase 4a: Bilateral filtering for edge-preserving smoothing (GPU accelerated if enabled)
+    # Phase 5a: Bilateral filtering for edge-preserving smoothing (GPU accelerated if enabled)
     img_smooth = bilateral_smooth_edges(
         img_flattened,
         use_gpu=use_gpu,
@@ -1348,7 +1412,7 @@ def restore_image(image_path, output_dir, use_gpu=False, gpu_backend=None, skip_
         preserve_mask=green_outline_mask
     )
     
-    # Phase 4b: Morphological cleanup with text protection
+    # Phase 5b: Morphological cleanup with text protection
     img_cleaned = morphological_cleanup(
         img_smooth,
         text_mask=text_mask,
@@ -1356,37 +1420,37 @@ def restore_image(image_path, output_dir, use_gpu=False, gpu_backend=None, skip_
         preserve_mask=green_outline_mask
     )
     
-    # Phase 4c: Edge-preserving smooth to reduce any remaining jaggedness
+    # Phase 5c: Edge-preserving smooth to reduce any remaining jaggedness
     img_smooth_outlines = edge_preserving_smooth(img_cleaned, preserve_mask=green_outline_mask)
     
-    # Phase 4d: Apply anti-aliasing for smoother color transitions
+    # Phase 5d: Apply anti-aliasing for smoother color transitions
     img_antialiased = apply_anti_aliasing(img_smooth_outlines, preserve_mask=green_outline_mask)
     
-    # Phase 4e: Solidify color regions (remove any remaining texture)
+    # Phase 5e: Solidify color regions (remove any remaining texture)
     img_solid = solidify_color_regions(img_antialiased, preserve_mask=green_outline_mask)
     
-    # Phase 4f: Snap to exact palette colors
+    # Phase 5f: Snap to exact palette colors
     img_quantized = snap_to_palette(img_solid)
     
-    # Phase 4g: Remove isolated specs (white dots, color noise)
+    # Phase 5g: Remove isolated specs (white dots, color noise)
     if skip_despec:
         print("Skipping isolated spec removal (--skip-despec enabled)")
         img_despecked = img_quantized
     else:
         img_despecked = remove_isolated_specs(img_quantized, min_area=50)
     
-    # Phase 4h: Normalize outline widths for consistency
+    # Phase 5h: Normalize outline widths for consistency
     if skip_outline_normalization:
         print("Skipping outline width normalization (--skip-outline-normalization enabled)")
         img_uniform = img_despecked
     else:
         img_uniform = uniform_outline_width(img_despecked)
     
-    # Phase 4i: Vectorize edges for clean, vector-like appearance
+    # Phase 5i: Vectorize edges for clean, vector-like appearance
     # Straightens rectangles while preserving curves/circles
     img_vectorized = vectorize_edges(img_uniform)
     
-    # Phase 4j: Smooth jagged edges for final cleanup
+    # Phase 5j: Smooth jagged edges for final cleanup
     img_smooth_edges = smooth_jagged_edges(img_vectorized)
     
     # Phase 5: Downscale back to original size
