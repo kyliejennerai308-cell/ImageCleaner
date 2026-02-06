@@ -481,7 +481,7 @@ def preprocess_with_hsv(img, use_natural_green=False, skip_infill=False):
     outline_magenta_mask = pink_hue_mask & (v > 180) & (v <= 240)
     dark_purple_mask = pink_hue_mask & (v > 50) & (v <= 180)
     
-    # Close small gaps in outline layers with a small kernel to avoid thickening
+    # Close small gaps in outline layers with a small kernel to limit thickening
     outline_magenta_mask = close_small_gaps(outline_magenta_mask)
     dark_purple_mask = close_small_gaps(dark_purple_mask)
     
