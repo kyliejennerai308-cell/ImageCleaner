@@ -173,13 +173,15 @@ PALETTE = {
 }
 
 # Convert palette to arrays for vectorized operations
-PALETTE_ARRAY_UINT8 = np.array(list(PALETTE.values()), dtype=np.uint8)
-PALETTE_ARRAY = PALETTE_ARRAY_UINT8.astype(np.float32)
+PALETTE_ARRAY = np.array(list(PALETTE.values()), dtype=np.float32)
+PALETTE_ARRAY_UINT8 = PALETTE_ARRAY.astype(np.uint8)
 PALETTE_LAB_ARRAY = cv2.cvtColor(
     PALETTE_ARRAY_UINT8.reshape(-1, 1, 3),
     cv2.COLOR_BGR2LAB
 ).reshape(-1, 3).astype(np.float32)
 PALETTE_NAMES = list(PALETTE.keys())
+
+SMALL_KERNEL_SIZE = (5, 5)
 
 
 def load_and_upscale(image_path, scale=3, use_gpu=False, gpu_backend=None):
@@ -251,15 +253,16 @@ def _remove_small_components(mask, min_area=20):
     return cleaned.astype(bool)
 
 
-def pre_smooth_texture(img, passes=2, d=9, sigma_color=50, sigma_space=50):
+def pre_smooth_texture(img, passes=2, diameter=9, sigma_color=50, sigma_space=50):
     """
     Apply multiple bilateral passes to flatten texture and banding
-    before color segmentation.
+    before color segmentation. Multiple passes gently reduce streaking
+    without aggressively bleeding edges in a single heavy filter pass.
     """
     print("Pre-smoothing scan texture with bilateral filtering...")
     smoothed = img.copy()
     for _ in range(passes):
-        smoothed = cv2.bilateralFilter(smoothed, d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
+        smoothed = cv2.bilateralFilter(smoothed, diameter, sigma_color, sigma_space)
     return smoothed
 
 
@@ -270,7 +273,7 @@ def apply_clahe_lab(img, clip_limit=2.0, tile_grid_size=(8, 8)):
     print("Applying CLAHE lighting normalization...")
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l_channel, a_channel, b_channel = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    clahe = cv2.createCLAHE(clip_limit, tile_grid_size)
     l_channel = clahe.apply(l_channel)
     lab_normalized = cv2.merge([l_channel, a_channel, b_channel])
     return cv2.cvtColor(lab_normalized, cv2.COLOR_LAB2BGR)
@@ -288,9 +291,31 @@ def remove_specular_highlights(img, s_thresh=40, v_thresh=220, inpaint_radius=3)
         print("  No specular highlights detected")
         return img
     mask = (glare_mask.astype(np.uint8) * 255)
-    glare_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    glare_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, SMALL_KERNEL_SIZE)
     mask = cv2.dilate(mask, glare_kernel, iterations=1)
-    return cv2.inpaint(img, mask, inpaintRadius=inpaint_radius, flags=cv2.INPAINT_TELEA)
+    return cv2.inpaint(img, mask, inpaint_radius, cv2.INPAINT_TELEA)
+
+
+def close_small_gaps(mask, kernel_size=None, iterations=1, return_as_uint8=False):
+    """
+    Close small gaps in a binary mask using morphological closing.
+    Returns a bool mask by default; set return_as_uint8 for 0/255 output.
+    """
+    if kernel_size is None:
+        kernel_size = SMALL_KERNEL_SIZE
+    mask_uint8 = mask.astype(np.uint8)
+    if mask_uint8.size == 0:
+        empty_shape = mask.shape
+        if return_as_uint8:
+            return np.zeros(empty_shape, dtype=np.uint8)
+        return np.zeros(empty_shape, dtype=bool)
+    if mask_uint8.max() == 1:
+        mask_uint8 = mask_uint8 * 255
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, kernel_size)
+    closed = cv2.morphologyEx(mask_uint8, cv2.MORPH_CLOSE, close_kernel, iterations=iterations)
+    if return_as_uint8:
+        return closed
+    return closed > 0
 
 
 def preprocess_with_hsv(img, use_natural_green=False, skip_infill=False):
@@ -456,20 +481,9 @@ def preprocess_with_hsv(img, use_natural_green=False, skip_infill=False):
     outline_magenta_mask = pink_hue_mask & (v > 180) & (v <= 240)
     dark_purple_mask = pink_hue_mask & (v > 50) & (v <= 180)
     
-    # Close small gaps in outline layers without thickening fills
-    outline_close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    outline_magenta_mask = cv2.morphologyEx(
-        outline_magenta_mask.astype(np.uint8) * 255,
-        cv2.MORPH_CLOSE,
-        outline_close_kernel,
-        iterations=1
-    ) > 0
-    dark_purple_mask = cv2.morphologyEx(
-        dark_purple_mask.astype(np.uint8) * 255,
-        cv2.MORPH_CLOSE,
-        outline_close_kernel,
-        iterations=1
-    ) > 0
+    # Close small gaps in outline layers with a small kernel to avoid thickening
+    outline_magenta_mask = close_small_gaps(outline_magenta_mask)
+    dark_purple_mask = close_small_gaps(dark_purple_mask)
     
     # Use contour-tree approach for hot pink to respect internal holes (e.g., logo text)
     pink_uint8 = hot_pink_mask.astype(np.uint8) * 255
@@ -791,7 +805,8 @@ def morphological_cleanup(
 
 def snap_to_palette(img, protect_outlines=False):
     """
-    Snap every pixel to the nearest palette color using Lab distance.
+    Snap every pixel to the nearest palette color using Lab distance
+    for perceptual accuracy (better hue similarity than raw BGR distance).
     Uses tile-based processing for large images to prevent memory exhaustion.
     """
     print("Snapping to palette colors...")
@@ -817,7 +832,8 @@ def snap_to_palette(img, protect_outlines=False):
     if total_pixels <= MAX_TILE_PIXELS:
         # Small enough to process in one go
         print(f"  Processing entire image ({total_pixels:,} pixels)")
-        quantized = _snap_to_palette_single(img)
+        img_lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        quantized = _snap_to_palette_single(img_lab)
     else:
         # Use tile-based processing for large images
         tile_size = int(math.sqrt(MAX_TILE_PIXELS))
@@ -843,9 +859,10 @@ def snap_to_palette(img, protect_outlines=False):
                 
                 # Extract tile
                 tile = img[y_start:y_end, x_start:x_end]
+                tile_lab = cv2.cvtColor(tile, cv2.COLOR_BGR2LAB)
                 
                 # Process tile
-                tile_quantized = _snap_to_palette_single(tile, show_stats=False)
+                tile_quantized = _snap_to_palette_single(tile_lab, show_stats=False)
                 
                 # Put tile back
                 quantized[y_start:y_end, x_start:x_end] = tile_quantized
@@ -872,16 +889,13 @@ def snap_to_palette(img, protect_outlines=False):
     return quantized
 
 
-def _snap_to_palette_single(img, show_stats=True):
+def _snap_to_palette_single(img_lab, show_stats=True):
     """
-    Helper function to snap a single image/tile to palette colors.
+    Helper function to snap a single Lab image/tile to palette colors.
     This is the core snapping logic extracted for reuse.
     """
-    # Convert to Lab for perceptual color distance
-    img_lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
-    
     # Reshape image to (num_pixels, 3)
-    pixels = img_lab.reshape(-1, 3)
+    pixels = img_lab.reshape(-1, 3).astype(np.float32)
     
     # Compute distance to each palette color (vectorized)
     # Shape: (num_pixels, num_colors)
@@ -894,7 +908,7 @@ def _snap_to_palette_single(img, show_stats=True):
     quantized_pixels = PALETTE_ARRAY[closest_indices].astype(np.uint8)
     
     # Reshape back to image
-    quantized = quantized_pixels.reshape(img.shape)
+    quantized = quantized_pixels.reshape(img_lab.shape)
     
     if show_stats:
         # Count pixels per color
@@ -1117,10 +1131,6 @@ def vectorize_edges(img, straightness_threshold=0.001, min_contour_area=500):
         mask = np.all(img == color_bgr, axis=2).astype(np.uint8) * 255
         is_outline_color = color_name in outline_color_names
         
-        if is_outline_color:
-            close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
-        
         if np.sum(mask) < min_contour_area:
             continue
         
@@ -1143,10 +1153,10 @@ def vectorize_edges(img, straightness_threshold=0.001, min_contour_area=500):
             if is_outline_color:
                 # Draw as STROKE, not fill - preserves outline nature
                 thickness = min(2, max(1, int(0.003 * perimeter)))  # Thin for outlines
-                cv2.drawContours(new_mask, [approx], -1, 255, thickness=thickness, lineType=cv2.LINE_8)
+                cv2.drawContours(new_mask, [approx], -1, 255, thickness=thickness)
             else:
                 # Preserve curves with low epsilon
-                cv2.drawContours(new_mask, [approx], -1, 255, -1, lineType=cv2.LINE_8)
+                cv2.drawContours(new_mask, [approx], -1, 255, -1)
         
         # Handle holes (hierarchy level 1) - only for filled regions
         if hierarchy is not None and not is_outline_color:
