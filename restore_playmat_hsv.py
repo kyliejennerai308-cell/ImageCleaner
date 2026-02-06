@@ -782,7 +782,7 @@ def morphological_cleanup(
     # Restore white and pink pixels again after MORPH_CLOSE
     cleaned[protected_pixel_mask] = img[protected_pixel_mask]
     
-    # If text mask provided, blend original with cleaned to preserve text holes
+    # If text mask provided, preserve original pixels to keep text holes intact
     if text_mask is not None:
         print("  Applying text protection - preserving original in text regions...")
         text_cleaned = img
