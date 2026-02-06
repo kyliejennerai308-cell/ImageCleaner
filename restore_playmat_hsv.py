@@ -280,7 +280,19 @@ def apply_clahe_lab(img, clip_limit=2.0, tile_grid_size=(8, 8)):
     return cv2.cvtColor(lab_normalized, cv2.COLOR_LAB2BGR)
 
 
-def remove_specular_highlights(img, s_thresh=40, v_thresh=220, inpaint_radius=3):
+def detect_white_mask(img, s_thresh=60, v_thresh=180, min_area=10):
+    """
+    Detect likely white elements (text, stars, logo interiors) in HSV space.
+    """
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    _, s, v = cv2.split(hsv)
+    mask = (s < s_thresh) & (v > v_thresh)
+    if min_area and min_area > 0:
+        mask = _remove_small_components(mask, min_area=min_area)
+    return mask
+
+
+def remove_specular_highlights(img, s_thresh=40, v_thresh=220, inpaint_radius=3, preserve_mask=None):
     """
     Detect and inpaint bright, low-saturation glare regions.
     """
@@ -288,6 +300,8 @@ def remove_specular_highlights(img, s_thresh=40, v_thresh=220, inpaint_radius=3)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     _, s, v = cv2.split(hsv)
     glare_mask = (s < s_thresh) & (v > v_thresh)
+    if preserve_mask is not None:
+        glare_mask &= ~preserve_mask
     if not np.any(glare_mask):
         print("  No specular highlights detected")
         return img
@@ -1397,13 +1411,14 @@ def restore_image(image_path, output_dir, use_gpu=False, gpu_backend=None, skip_
     # Phase 1: Load and upscale (GPU accelerated if enabled)
     img_large, original_size = load_and_upscale(image_path, use_gpu=use_gpu, gpu_backend=gpu_backend)
     
-    # Phase 2: Preprocess illumination/texture before segmentation
+    # Phase 2: Detect white/text regions before preprocessing
+    white_mask_raw = detect_white_mask(img_large, min_area=10)
+    text_mask = detect_text_regions(img_large)
+    
+    # Phase 3: Preprocess illumination/texture before segmentation
     img_smoothed = pre_smooth_texture(img_large)
     img_normalized = apply_clahe_lab(img_smoothed)
-    img_corrected = remove_specular_highlights(img_normalized)
-    
-    # Phase 3: Detect text regions for protection BEFORE any segmentation
-    text_mask = detect_text_regions(img_corrected)
+    img_corrected = remove_specular_highlights(img_normalized, preserve_mask=white_mask_raw)
     
     # Phase 4: HSV-based color preprocessing
     img_preprocessed, green_outline_mask, white_mask_large = preprocess_with_hsv(
@@ -1411,6 +1426,7 @@ def restore_image(image_path, output_dir, use_gpu=False, gpu_backend=None, skip_
         use_natural_green=use_natural_green,
         skip_infill=skip_infill
     )
+    white_mask_large |= white_mask_raw
     
     # Phase 4b: Flatten background wrinkles before palette snapping
     img_flattened = flatten_background_wrinkles(img_preprocessed)
