@@ -785,12 +785,12 @@ def morphological_cleanup(
     # If text mask provided, preserve original pixels to keep text holes intact
     if text_mask is not None:
         print("  Applying text protection - preserving original in text regions...")
-        text_cleaned = img
+        text_preserved = img
         
         text_mask_3ch = cv2.cvtColor(text_mask, cv2.COLOR_GRAY2BGR)
         text_mask_float = text_mask_3ch.astype(np.float32) / 255.0
         
-        cleaned = (text_mask_float * text_cleaned + (1 - text_mask_float) * cleaned).astype(np.uint8)
+        cleaned = (text_mask_float * text_preserved + (1 - text_mask_float) * cleaned).astype(np.uint8)
 
     if preserve_mask is not None:
         cleaned[preserve_mask] = img[preserve_mask]
