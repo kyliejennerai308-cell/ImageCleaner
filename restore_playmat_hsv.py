@@ -458,6 +458,36 @@ def preprocess_with_hsv(img, use_natural_green=False, skip_infill=False):
     return img_processed, green_mask_final, white_mask
 
 
+def flatten_background_wrinkles(
+    img,
+    h=25,
+    h_color=25,
+    template_window=7,
+    search_window=31
+):
+    """
+    Apply stronger denoising to sky-blue background only to remove faint wrinkles
+    before palette snapping and contour redraw.
+    """
+    print("Flattening background wrinkles (sky blue only)...")
+    sky_blue = np.array(PALETTE['sky_blue'], dtype=np.uint8)
+    bg_mask = np.all(img == sky_blue, axis=2)
+    if not np.any(bg_mask):
+        print("  No sky-blue pixels detected; skipping background flattening")
+        return img
+    denoised = cv2.fastNlMeansDenoisingColored(
+        img.astype(np.uint8),
+        None,
+        h=h,
+        hColor=h_color,
+        templateWindowSize=template_window,
+        searchWindowSize=search_window
+    )
+    result = img.copy()
+    result[bg_mask] = denoised[bg_mask]
+    return result
+
+
 def bilateral_smooth_edges(img, d=9, sigma_color=50, sigma_space=50, use_gpu=False, gpu_backend=None, preserve_mask=None):
     """
     Apply mask-based denoising. Aggressive smoothing for background, 
@@ -611,18 +641,26 @@ def morphological_cleanup(
     """
     print(f"Applying gentle morphological cleanup (kernel={kernel_size})...")
     
-    # Create white, pink, yellow, and green protection masks - these regions skip MORPH_OPEN
+    # Create white, pink, yellow, green, and outline protection masks - these regions skip MORPH_OPEN
     # to preserve thin structures like copyright text, logo details, and yellow
     # silhouette fine details (hair, fingers, shoe heels, leg gaps)
     pure_white = np.array(PALETTE['pure_white'], dtype=np.uint8)
     hot_pink = np.array(PALETTE['hot_pink'], dtype=np.uint8)
     bright_yellow = np.array(PALETTE['bright_yellow'], dtype=np.uint8)
     neon_green = np.array(PALETTE['neon_green'], dtype=np.uint8)
+    outline_magenta = np.array(PALETTE['outline_magenta'], dtype=np.uint8)
     white_pixel_mask = np.all(img == pure_white, axis=2)
     pink_pixel_mask = np.all(img == hot_pink, axis=2)
     yellow_pixel_mask = np.all(img == bright_yellow, axis=2)
     green_pixel_mask = np.all(img == neon_green, axis=2)
-    protected_pixel_mask = white_pixel_mask | pink_pixel_mask | yellow_pixel_mask | green_pixel_mask
+    outline_pixel_mask = np.all(img == outline_magenta, axis=2)
+    protected_pixel_mask = (
+        white_pixel_mask
+        | pink_pixel_mask
+        | yellow_pixel_mask
+        | green_pixel_mask
+        | outline_pixel_mask
+    )
     
     # Use a smaller kernel to avoid eating thin lines
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
@@ -836,8 +874,8 @@ def remove_isolated_specs(img, min_area=50):
     # Process each palette color
     for color_name, color_bgr in PALETTE.items():
         # Skip background colors, black, pure_white (to preserve white text),
-        # and neon_green (to preserve lime green heading text)
-        if color_name in ['sky_blue', 'black', 'pure_white', 'neon_green']:
+        # neon_green (to preserve lime green heading text), and yellow/pink layers
+        if color_name in ['sky_blue', 'black', 'pure_white', 'neon_green', 'bright_yellow', 'hot_pink', 'outline_magenta']:
             continue
             
         color_bgr = np.array(color_bgr, dtype=np.uint8)
@@ -946,10 +984,9 @@ def uniform_outline_width(img):
     
     img_result = img.copy()
     
-    # Define outline colors - SKIP neon_green to prevent thickness stacking
-    # neon_green is already thin and should stay thin
+    # Define outline colors - SKIP neon_green and outline_magenta to prevent thickness stacking
+    # neon_green is already thin and should stay thin; outline_magenta should not thicken
     outline_colors = {
-        'outline_magenta': PALETTE['outline_magenta'],
         'dark_purple': PALETTE['dark_purple'],
         'vibrant_red': PALETTE['vibrant_red']
     }
@@ -1111,7 +1148,6 @@ def smooth_jagged_edges(img):
     # Define outline colors that should be treated as strokes
     # SKIP neon_green entirely - it's already thin and any processing fattens it
     outline_colors_to_process = {
-        'outline_magenta',
         'dark_purple',
         'vibrant_red'
     }
@@ -1119,9 +1155,9 @@ def smooth_jagged_edges(img):
     # Process each color region
     for color_name, color_bgr in PALETTE.items():
         # Skip background, black, neon_green (to prevent thickness stacking),
-        # pure_white (to preserve text detail), hot_pink (to preserve small logo details),
+        # pure_white (to preserve text detail), hot_pink and outline_magenta (avoid thickening),
         # and bright_yellow (to preserve silhouette fine details like hair, fingers, heels)
-        if color_name in ['sky_blue', 'black', 'neon_green', 'pure_white', 'hot_pink', 'bright_yellow']:
+        if color_name in ['sky_blue', 'black', 'neon_green', 'pure_white', 'hot_pink', 'outline_magenta', 'bright_yellow']:
             continue
             
         color_bgr = np.array(color_bgr, dtype=np.uint8)
@@ -1294,9 +1330,12 @@ def restore_image(image_path, output_dir, use_gpu=False, gpu_backend=None, skip_
         skip_infill=skip_infill
     )
     
+    # Phase 3b: Flatten background wrinkles before palette snapping
+    img_flattened = flatten_background_wrinkles(img_preprocessed)
+    
     # Phase 4a: Bilateral filtering for edge-preserving smoothing (GPU accelerated if enabled)
     img_smooth = bilateral_smooth_edges(
-        img_preprocessed,
+        img_flattened,
         use_gpu=use_gpu,
         gpu_backend=gpu_backend,
         preserve_mask=green_outline_mask
@@ -1310,38 +1349,38 @@ def restore_image(image_path, output_dir, use_gpu=False, gpu_backend=None, skip_
         preserve_mask=green_outline_mask
     )
     
-    # Phase 4c: Snap to exact palette colors
-    img_quantized = snap_to_palette(img_cleaned)
+    # Phase 4c: Edge-preserving smooth to reduce any remaining jaggedness
+    img_smooth_outlines = edge_preserving_smooth(img_cleaned, preserve_mask=green_outline_mask)
     
-    # Phase 4d: Remove isolated specs (white dots, color noise)
+    # Phase 4d: Apply anti-aliasing for smoother color transitions
+    img_antialiased = apply_anti_aliasing(img_smooth_outlines, preserve_mask=green_outline_mask)
+    
+    # Phase 4e: Solidify color regions (remove any remaining texture)
+    img_solid = solidify_color_regions(img_antialiased, preserve_mask=green_outline_mask)
+    
+    # Phase 4f: Snap to exact palette colors
+    img_quantized = snap_to_palette(img_solid)
+    
+    # Phase 4g: Remove isolated specs (white dots, color noise)
     if skip_despec:
         print("Skipping isolated spec removal (--skip-despec enabled)")
         img_despecked = img_quantized
     else:
         img_despecked = remove_isolated_specs(img_quantized, min_area=50)
     
-    # Phase 4e: Normalize outline widths for consistency
+    # Phase 4h: Normalize outline widths for consistency
     if skip_outline_normalization:
         print("Skipping outline width normalization (--skip-outline-normalization enabled)")
         img_uniform = img_despecked
     else:
         img_uniform = uniform_outline_width(img_despecked)
     
-    # Phase 4f: Vectorize edges for clean, vector-like appearance
+    # Phase 4i: Vectorize edges for clean, vector-like appearance
     # Straightens rectangles while preserving curves/circles
     img_vectorized = vectorize_edges(img_uniform)
     
-    # Phase 4g: Smooth jagged edges for final cleanup
+    # Phase 4j: Smooth jagged edges for final cleanup
     img_smooth_edges = smooth_jagged_edges(img_vectorized)
-    
-    # Phase 4h: Edge-preserving smooth to reduce any remaining jaggedness
-    img_smooth_outlines = edge_preserving_smooth(img_smooth_edges, preserve_mask=green_outline_mask)
-    
-    # Phase 4i: Apply anti-aliasing for smoother color transitions
-    img_antialiased = apply_anti_aliasing(img_smooth_outlines, preserve_mask=green_outline_mask)
-    
-    # Phase 4j: Solidify color regions (remove any remaining texture)
-    img_solid = solidify_color_regions(img_antialiased, preserve_mask=green_outline_mask)
     
     # Phase 5: Downscale back to original size
     print(f"Downscaling to original size: {original_size}")
@@ -1351,28 +1390,28 @@ def restore_image(image_path, output_dir, use_gpu=False, gpu_backend=None, skip_
         if gpu_backend == 'opencv':
             try:
                 gpu_img = cv2.cuda_GpuMat()
-                gpu_img.upload(img_solid)
+                gpu_img.upload(img_smooth_edges)
                 gpu_resized = cv2.cuda.resize(gpu_img, original_size, interpolation=cv2.INTER_AREA)
                 img_final = gpu_resized.download()
             except cv2.error:
-                img_final = cv2.resize(img_solid, original_size, interpolation=cv2.INTER_AREA)
+                img_final = cv2.resize(img_smooth_edges, original_size, interpolation=cv2.INTER_AREA)
         elif gpu_backend == 'cupy' and CUPY_AVAILABLE:
             try:
                 from cupyx.scipy.ndimage import zoom
-                img_gpu = cp.asarray(img_solid)
+                img_gpu = cp.asarray(img_smooth_edges)
                 # Calculate zoom factors to reach target size
-                zoom_h = original_size[1] / img_solid.shape[0]
-                zoom_w = original_size[0] / img_solid.shape[1]
+                zoom_h = original_size[1] / img_smooth_edges.shape[0]
+                zoom_w = original_size[0] / img_smooth_edges.shape[1]
                 # order=1 is bilinear interpolation (approximation for downscaling,
                 # not equivalent to cv2.INTER_AREA which averages pixels)
                 img_resized_gpu = zoom(img_gpu, (zoom_h, zoom_w, 1), order=1)
                 img_final = cp.asnumpy(img_resized_gpu)
             except Exception:
-                img_final = cv2.resize(img_solid, original_size, interpolation=cv2.INTER_AREA)
+                img_final = cv2.resize(img_smooth_edges, original_size, interpolation=cv2.INTER_AREA)
         else:
-            img_final = cv2.resize(img_solid, original_size, interpolation=cv2.INTER_AREA)
+            img_final = cv2.resize(img_smooth_edges, original_size, interpolation=cv2.INTER_AREA)
     else:
-        img_final = cv2.resize(img_solid, original_size, interpolation=cv2.INTER_AREA)
+        img_final = cv2.resize(img_smooth_edges, original_size, interpolation=cv2.INTER_AREA)
     
     # Phase 6: Final palette enforcement (protect outlines from being reassigned)
     img_final = snap_to_palette(img_final, protect_outlines=True)
@@ -1383,13 +1422,6 @@ def restore_image(image_path, output_dir, use_gpu=False, gpu_backend=None, skip_
     else:
         img_final = remove_isolated_specs(img_final, min_area=20)
     
-    # Phase 8: Final edge smoothing at output resolution
-    img_final = smooth_jagged_edges(img_final)
-    
-    # Phase 8b: Final palette snap to ensure no intermediate colors remain
-    # smooth_jagged_edges can create blended colors, so we snap back to palette
-    img_final = snap_to_palette(img_final, protect_outlines=True)
-
     # Phase 9: Reapply extracted green line to preserve original outline details
     # Layering order: Blue background -> Green line -> Yellow silhouette -> Pink/White logos
     green_outline_mask_small = cv2.resize(
