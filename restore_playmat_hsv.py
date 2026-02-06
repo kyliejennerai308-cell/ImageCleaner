@@ -475,8 +475,12 @@ def flatten_background_wrinkles(
     if not np.any(bg_mask):
         print("  No sky-blue pixels detected; skipping background flattening")
         return img
+    ys, xs = np.where(bg_mask)
+    y_min, y_max = ys.min(), ys.max()
+    x_min, x_max = xs.min(), xs.max()
+    roi = img[y_min:y_max + 1, x_min:x_max + 1]
     denoised = cv2.fastNlMeansDenoisingColored(
-        img.astype(np.uint8),
+        roi.astype(np.uint8),
         None,
         h=h,
         hColor=h_color,
@@ -484,7 +488,10 @@ def flatten_background_wrinkles(
         searchWindowSize=search_window
     )
     result = img.copy()
-    result[bg_mask] = denoised[bg_mask]
+    roi_mask = bg_mask[y_min:y_max + 1, x_min:x_max + 1]
+    roi_result = result[y_min:y_max + 1, x_min:x_max + 1]
+    roi_result[roi_mask] = denoised[roi_mask]
+    result[y_min:y_max + 1, x_min:x_max + 1] = roi_result
     return result
 
 
