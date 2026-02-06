@@ -287,7 +287,7 @@ def detect_white_mask(img, s_thresh=60, v_thresh=180, min_area=10):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     _, s, v = cv2.split(hsv)
     mask = (s < s_thresh) & (v > v_thresh)
-    if min_area and min_area > 0:
+    if min_area > 0:
         mask = _remove_small_components(mask, min_area=min_area)
     return mask
 
@@ -301,7 +301,7 @@ def remove_specular_highlights(img, s_thresh=40, v_thresh=220, inpaint_radius=3,
     _, s, v = cv2.split(hsv)
     glare_mask = (s < s_thresh) & (v > v_thresh)
     if preserve_mask is not None:
-        glare_mask &= ~preserve_mask
+        glare_mask &= ~preserve_mask.astype(bool)
     if not np.any(glare_mask):
         print("  No specular highlights detected")
         return img
@@ -1426,7 +1426,7 @@ def restore_image(image_path, output_dir, use_gpu=False, gpu_backend=None, skip_
         use_natural_green=use_natural_green,
         skip_infill=skip_infill
     )
-    white_mask_large |= white_mask_raw
+    white_mask_combined = white_mask_large | white_mask_raw
     
     # Phase 4b: Flatten background wrinkles before palette snapping
     img_flattened = flatten_background_wrinkles(img_preprocessed)
@@ -1559,7 +1559,7 @@ def restore_image(image_path, output_dir, use_gpu=False, gpu_backend=None, skip_
     # Downscale the white mask from the upscaled image to the final output size
     # This ensures copyright text and logo details aren't covered by green/yellow dilation
     white_mask_small = cv2.resize(
-        white_mask_large.astype(np.uint8) * 255,
+        white_mask_combined.astype(np.uint8) * 255,
         original_size,
         interpolation=cv2.INTER_NEAREST
     ) > 0
