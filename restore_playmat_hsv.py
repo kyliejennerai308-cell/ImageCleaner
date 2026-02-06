@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# NOTE: Keep START_HERE.bat updated if any script changes require new flags, dependencies, or usage.
 """
 Vinyl Playmat Digital Restoration Script - HSV-Based Implementation
 Removes wrinkles, glare, and texture from scanned vinyl playmat images
