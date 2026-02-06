@@ -782,15 +782,10 @@ def morphological_cleanup(
     # Restore white and pink pixels again after MORPH_CLOSE
     cleaned[protected_pixel_mask] = img[protected_pixel_mask]
     
-    # If text mask provided, blend original with cleaned to preserve text
+    # If text mask provided, blend original with cleaned to preserve text holes
     if text_mask is not None:
         print("  Applying text protection - preserving original in text regions...")
-        text_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        if skip_infill:
-            # Skip MORPH_CLOSE for text regions too
-            text_cleaned = img
-        else:
-            text_cleaned = cv2.morphologyEx(img, cv2.MORPH_CLOSE, text_kernel, iterations=1)
+        text_cleaned = img
         
         text_mask_3ch = cv2.cvtColor(text_mask, cv2.COLOR_GRAY2BGR)
         text_mask_float = text_mask_3ch.astype(np.float32) / 255.0
