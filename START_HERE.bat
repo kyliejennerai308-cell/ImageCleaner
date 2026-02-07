@@ -58,14 +58,13 @@ echo ===========================================================================
 echo.
 echo Active Flags:
 echo   - GPU Enabled (--use-gpu)
-echo   - Fast Processing (--skip-despec)
+echo   - Full Cleanup (--no-preserve-detail)
 echo.
-echo * NOTE: Outline Normalization and Infill are NOW ACTIVE to fix
-echo         borders and clean noise.
+echo * NOTE: Full cleanup enables despec, outline normalization, and infill.
 echo.
 
 REM This command runs your script with the new logic enabled
-python restore_playmat_hsv.py scans/ --skip-despec --use-gpu
+python restore_playmat_hsv.py scans/ --no-preserve-detail --use-gpu
 
 if errorlevel 1 (
     echo.
