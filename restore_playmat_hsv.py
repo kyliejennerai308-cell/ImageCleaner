@@ -1562,7 +1562,7 @@ def restore_image(image_path, output_dir, use_gpu=False, gpu_backend=None, skip_
     img_final[white_mask_small] = pure_white
     print(f"  White priority stamp: {np.sum(white_mask_small):,} pixels restored")
     
-    # Phase 11: Final palette enforcement after all stamps
+    # Final palette enforcement after all stamps
     img_final = snap_to_palette(img_final, protect_outlines=True)
     
     # Save output
